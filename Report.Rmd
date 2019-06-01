@@ -1,0 +1,200 @@
+---
+title: "AlarmFatigue"
+author: "Bingyue He"
+date: "5/31/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(forecast)
+```
+
+Take patient 2221 as example. First we load the dataset.
+
+```{r}
+patient2221 <- read.csv("~/Desktop/DSI Project/2221.csv")
+time21 <- patient2221$ParTime
+p21 <- data.frame(time21, patient2221$AR1.D, patient2221$AR1.M, patient2221$AR1.S,
+                  patient2221$AR2.D,patient2221$HR)
+colnames(p21) <- c("time", "AR1D", "AR1M", "AR1S", "AR2D","HR")
+
+#remove all NA data for AR1D and AR1M
+p21.clean <- p21[!is.na(p21$AR1D) & ! is.na(p21$AR1M) ,]  
+summary(p21.clean)
+```
+
+##Kalman Filter
+
+First implement function for one-variable predictor
+```{r}
+my_kalman <- function(df, v=1, q=0.1, p=100, pred=df$AR1D){
+  df$est <- NA
+  est.minus <- 0
+  p.minus <- 0
+  df$est[1] <- est.minus
+
+  for (i in 2:nrow(df)){
+    p.minus <- p+q
+    k <- p.minus/(p.minus+v)
+    df$est[i] <- est.minus + k*(pred[i]-est.minus)
+    p <- (1-k)*p.minus
+    est.minus <- df$est[i]
+  }
+  return(df)
+}
+```
+
+Now apply it to predict AR1D and AR1M, seperately. 
+
+For AR1D, we get
+```{r}
+est.AR1D <- my_kalman(p21.clean)
+ggplot(data=est.AR1D,aes(x=time)) + geom_point(aes(y=AR1D,colour="Data")) + 
+  geom_point(aes(y=est,colour="Estimation")) + 
+  scale_color_manual(values = c('Data' = 'blue', 'Estimation' = 'red'))+
+  theme_classic()
+```
+
+
+For AR1M, we get
+```{r}
+est.AR1M <- my_kalman(p21.clean,pred=p21.clean$AR1M)
+ggplot(est.AR1M) + geom_point(aes(x=time, y=AR1M,colour="Data")) + 
+  geom_point(aes(x=time, y=est,colour="Estimation")) + 
+  scale_color_manual(values = c('Data' = 'blue', 'Estimation' = 'red'))+
+  theme_classic()
+```
+
+Now we implement Kalman filters for predicting two variables
+```{r}
+my_kalman_2 <- function(df, r=matrix(c(1,0,0,1),nrow=2), 
+                        q=matrix(c(0.1,0,0,0.1),nrow=2), 
+                        p=matrix(c(100,0,0,100),nrow=2), 
+                        pred1=df$AR1D, pred2 = df$AR1M){
+  df$est1 <- NA
+  df$est2 <- NA 
+  est.minus <- c(0,0)
+  p.minus <- matrix(rep(0,4), nrow=2)
+  df$est1[1] <- est.minus[1]
+  df$est2[1] <- est.minus[2]
+  
+  for (i in 2:nrow(df)){
+    p.minus <- p+q
+    k <- p.minus %*% solve(p.minus+r)
+    pred.cur <- c(pred1[i],pred2[i])
+    est.cur <- est.minus + k %*% (pred.cur-est.minus)
+    df$est1[i] <- est.cur[1]
+    df$est2[i] <- est.cur[2]
+    p <- (diag(2)-k)%*%p.minus
+    est.minus <- c(df$est1[i], df$est2[i])
+  }
+  return(df)
+
+}
+
+```
+
+Apply it to AR1D and AR1M.
+```{r}
+est.AR1 <- my_kalman_2(p21.clean)
+
+pred.ar1d <- ggplot(est.AR1) + geom_point(aes(x=time, y=AR1D,colour="AR1D Data")) +
+  geom_point(aes(x=time, y=est1, colour="AR1D Est")) + 
+  scale_color_manual(values = c('AR1D Data' = 'blue', 'AR1D Est' = 'light blue')) +
+  theme_classic()
+
+
+pred.ar1m <- ggplot(est.AR1) + geom_point(aes(x=time, y=AR1M,colour="AR1M Data")) + 
+  geom_point(aes(x=time, y=est2, colour="AR1M Est")) + 
+  scale_color_manual(values = c('AR1M Data' = 'purple', 'AR1M Est' = 'light pink')) +
+  theme_classic()
+
+pred.ar1d
+
+pred.ar1m
+```
+
+
+##Time Averaging
+
+Unweighted time averaging prediction
+```{r}
+p21.clean$avg <- ma(p21.clean$AR1D,order=100)
+ggplot()+geom_line(data=p21.clean, aes(x=time, y=AR1D, colour="AR1D"))+
+  geom_line(data=p21.clean, aes(x=time, y=avg,color="AR1.Avg"))+
+  scale_color_manual(values = c('AR1D' = 'purple', 'AR1.Avg' = 'light pink')) +
+  theme_classic()
+```
+
+Weighted time averaging prediction
+
+```{r}
+p21.clean$avg.weighted <- ma(p21.clean$AR1D,order=100,centre=TRUE)
+ggplot()+geom_line(data=p21.clean, aes(x=time, y=AR1D, colour="AR1D"))+
+  geom_line(data=p21.clean, aes(x=time, y=avg.weighted,color="AR1.Avg"))+
+  scale_color_manual(values = c('AR1D' = 'purple', 'AR1.Avg' = 'light pink')) +
+  theme_classic()
+```
+
+
+##Alarm reduced comparison
+
+First we summarize the median of the patient's AR1D and AR1M, use it as the "normal level".
+```{r}
+summary(p21.clean$AR1D)
+summary(p21.clean$AR1M)
+```
+
+Now we set the normal level for patient's AR1D as 78, and normal level for patient's AR1M as 115.
+
+We set alarms when it exceeds the 1st and 3rd quantile of the patients, which are (68, 99) for AR1D, and (103, 127) for AR1M. These numbers are purely for comparison and based on no pratical research.
+
+Now we assess the alarm situation for \textbf{AR1D}. 
+
+Before 
+```{r}
+sum(p21.clean$AR1D >= 99 | p21.clean$AR1D <= 68) / nrow(p21.clean)
+```
+
+After applying Kalman Filter.
+```{r}
+sum(est.AR1D$est >= 99 | est.AR1D$est <= 68) / nrow(est.AR1D)
+```
+
+After applying two variable's Kalman Filter
+```{r}
+sum(est.AR1$est1 >= 99| est.AR1$est1 <= 68) / nrow(est.AR1)
+```
+
+After applying time averaging.
+```{r}
+sum(na.omit(p21.clean$avg) >= 99 | na.omit(p21.clean$avg) <= 68) / nrow(p21.clean)
+```
+
+After applying weighted time averaging.
+
+```{r}
+sum(na.omit(p21.clean$avg.weighted) >= 99 | na.omit(p21.clean$avg.weighted) <= 68) / nrow(p21.clean)
+```
+
+
+Now we assess the alarm situation for \textbf{AR1M}. 
+
+Before 
+```{r}
+sum(p21.clean$AR1M >= 127 | p21.clean$AR1M <= 103) / nrow(p21.clean)
+```
+
+After applying Kalman Filter.
+```{r}
+sum(est.AR1M$est >= 127 | est.AR1M$est <= 103) / nrow(est.AR1M)
+```
+
+After applying two variable's Kalman Filter
+```{r}
+sum(est.AR1$est2 >= 127| est.AR1$est2 <= 103) / nrow(est.AR1)
+```
+
+
